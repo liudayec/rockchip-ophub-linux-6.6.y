@@ -1,0 +1,106 @@
+name: aiot-3588a ophub-6.6.y WITH MD+NETFILTER
+
+# 与原版 kdev-build.sh 完全相同的编译流程，唯一区别：
+# 在 defconfig 之后用 scripts/config 打开 MD(软RAID) 与 netfilter 相关选项，
+# 使 fnOS 能创建存储池（mdadm）、Docker 能用 bridge+NAT 网络。
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - default
+    paths:
+      - '.github/workflows/aiot-3588a-md.yml'
+
+env:
+  TZ: Asia/Shanghai
+
+jobs:
+  build-kernel:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          ref: aiot-3588a
+          fetch-depth: 1
+
+      - name: Install build dependency
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -qq -y --no-install-recommends \
+            bc bison flex libssl-dev libelf-dev libncurses-dev \
+            build-essential gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            device-tree-compiler kmod cpio rsync xxd python3 tar gzip xz-utils \
+            gawk sed grep coreutils
+
+      - name: Patch kdev-build.sh (enable MD / netfilter)
+        run: |
+          python3 - <<'PY'
+          import re, sys
+          p = 'kdev-build.sh'
+          s = open(p, encoding='utf-8', errors='replace').read()
+          if 'BLK_DEV_MD' in s:
+              print('已存在补丁，跳过'); sys.exit(0)
+          inject = r'''
+# ==========================================
+# 补丁：打开 MD(软RAID) 与 netfilter
+# 目的：fnOS 的存储池依赖 mdadm，Docker 的 bridge/NAT 依赖 iptables
+# ==========================================
+echo ">>> [PATCH] 打开 MD/RAID 与 netfilter 选项 ..."
+for opt in MD BLK_DEV_MD MD_LINEAR MD_RAID0 MD_RAID1 MD_RAID10 MD_RAID456 \
+           NETFILTER NETFILTER_ADVANCED NF_CONNTRACK NF_TABLES NF_TABLES_INET NF_NAT NF_TABLES_IPV4 \
+           IP_NF_IPTABLES IP_NF_FILTER IP_NF_NAT IP_NF_TARGET_MASQUERADE IP_NF_TARGET_REJECT \
+           NETFILTER_XTABLES NETFILTER_XT_MATCH_ADDRTYPE NETFILTER_XT_MATCH_COMMENT \
+           NETFILTER_XT_MATCH_MULTIPORT NETFILTER_XT_MATCH_CONNTRACK NETFILTER_XT_MATCH_LIMIT \
+           NETFILTER_XT_MATCH_CONNLIMIT NETFILTER_XT_MATCH_RECENT NETFILTER_XT_MARK NETFILTER_XT_NAT \
+           BRIDGE BRIDGE_NETFILTER; do
+  scripts/config --file .config --enable "$opt" || true
+done
+make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} olddefconfig
+echo ">>> [PATCH] 生效检查："
+grep -E "^CONFIG_(BLK_DEV_MD|MD_RAID1|NF_TABLES|IP_NF_IPTABLES)=" .config
+'''
+          m = re.search(r'\n\s*\$\{DEFCONFIG\}\n', s)
+          if not m:
+              sys.exit('ERROR: 未找到 defconfig 调用位置')
+          s = s[:m.end()] + inject + s[m.end():]
+          open(p, 'w', encoding='utf-8').write(s)
+          print('kdev-build.sh 已注入补丁')
+          PY
+          echo '--- 注入后的 defconfig 附近 ---'
+          grep -n -A6 'DEFCONFIG$' kdev-build.sh | head -30
+
+      - name: Build kernel
+        run: |
+          sudo ./kdev-build.sh
+          echo '=== 产物 ==='
+          ls -alh release/
+
+      - name: Verify config in artifact
+        run: |
+          KCFG=$(ls release/config-* | head -1)
+          echo "检查 $KCFG"
+          for k in CONFIG_BLK_DEV_MD CONFIG_MD_RAID1 CONFIG_MD_RAID10 CONFIG_NF_TABLES CONFIG_IP_NF_IPTABLES CONFIG_IP_NF_TARGET_MASQUERADE; do
+            printf '%-34s' "$k"
+            grep -E "^$k=y" "$KCFG" || echo '!! 仍是 not set'
+          done
+
+      - name: Upload Kernel to Release
+        uses: ncipollo/release-action@main
+        with:
+          tag: aiot-3588a_ophub-6.6.y-md
+          artifacts: ./release/*
+          allowUpdates: true
+          removeArtifacts: false
+          replacesArtifacts: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+          body: |
+            # aiot-3588a ophub-6.6.y (MD + netfilter 版)
+
+            在原版基础上打开了以下内核选项：
+
+            - CONFIG_BLK_DEV_MD / MD_RAID0/1/10/456 —— 让 fnOS 能创建存储池（mdadm）
+            - CONFIG_NF_TABLES / IP_NF_IPTABLES / IP_NF_NAT —— 让 Docker 能用 bridge + NAT
+
+            用途：替换 aiot-3588a 固件构建里的 KERNEL_URL，产出可建存储池的固件。
