@@ -11,6 +11,9 @@ on:
     paths:
       - '.github/workflows/aiot-3588a-md.yml'
 
+permissions:
+  contents: write
+
 env:
   TZ: Asia/Shanghai
 
